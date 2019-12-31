@@ -65,6 +65,8 @@ typedef struct ProvisioningParams_t
                                          *   If JITP is not being used, this value should be set to 0. */
 } ProvisioningParams_t;
 
+int xDeviceProvisioningForJITP( void );
+
 /** \brief Provisions device with default credentials.
  *
  * Imports the certificate and private key located in

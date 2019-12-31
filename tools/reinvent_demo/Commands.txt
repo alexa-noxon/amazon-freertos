@@ -1,0 +1,35 @@
+# Generate CA key pair
+openssl ecparam -name prime256v1 -genkey -noout -out signerCAKey.pem
+
+# Generate CA certificate
+openssl req -x509 -new -nodes -key signerCAKey.pem -sha256 -extensions v3_ca -days 1024 -out signerCACert.pem -subj "/C=US/ST=Nevada/L=LasVegas/O=reInvent/OU=AWS IoT/CN=CASignerCertificate"
+
+
+#Show certificate
+#openssl x509 -in signerCACert.pem -text -noout
+
+# Get code from AWS that is used to prove you own CA key pair
+aws iot get-registration-code
+
+
+# Generate verification key
+openssl ecparam -name prime256v1 -genkey -noout -out verificationCert.key
+
+# Generate verifiation key's CSR
+openssl req -new -key verificationCert.key -out verificationCert.csr -subj "/C=US/ST=WA/L=Seattle/O=AWS/OU=IoT/CN=<registration code>"
+
+# Create Verification Certificate
+openssl x509 -req -in verificationCert.csr -CA signerCACert.pem -CAkey signerCAKey.pem -CAcreateserial -out verificationCert.pem -days 1 -sha256 
+
+# Register your CA certificate 
+aws iot register-ca-certificate --ca-certificate file://signerCACert.pem --verification-cert file://verificationCert.pem --set-as-active --allow-auto-registration --registration-config file://provisioning_template.json
+
+# CREATING DEVICE CERTIFICATE
+openssl x509 -req -in device.csr -CA signerCACert.pem -CAkey signerCAKey.pem -CAcreateserial -out deviceCert.crt -days 365 -sha256
+
+Convert and "provision" device cert and JITP cert
+openssl x509 -in deviceCert.crt -outform der -out /mnt/c/b/reinvent/projects/pc/windows/visual_studio/aws_demos/FreeRTOS_P11_Certificate.dat
+
+openssl x509 -in signerCACert.pem -outform der -out /mnt/c/b/reinvent/projects/pc/windows/visual_studio/aws_demos/FreeRTOS_P11_JITP.dat
+
+DISABLE PROVISIONING!!!  Run Demo 2x.

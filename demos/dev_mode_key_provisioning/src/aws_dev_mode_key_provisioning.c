@@ -58,8 +58,16 @@
 #include "iot_pki_utils.h"
 
 /* mbedTLS includes. */
+
+#include "mbedtls/sha256.h"
 #include "mbedtls/pk.h"
+#include "mbedtls/pk_internal.h"
 #include "mbedtls/oid.h"
+#include "mbedtls/entropy.h"
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/x509.h"
+#include "mbedtls/x509_csr.h"
+#include "mbedtls/x509_crt.h"
 
 /* Default Amazon FreeRTOS API for console logging. */
 #define DEV_MODE_KEY_PROVISIONING_PRINT( X )    vLoggingPrintf X
@@ -843,100 +851,6 @@ static CK_RV prvExportPublicKey( CK_SESSION_HANDLE xSession,
     return xResult;
 }
 
-/* Determine which required client crypto objects are already present in
- * storage. */
-static CK_RV prvGetProvisionedState( CK_SESSION_HANDLE xSession,
-                                     ProvisionedState_t * pxProvisionedState )
-{
-    CK_RV xResult;
-    CK_FUNCTION_LIST_PTR pxFunctionList;
-    CK_SLOT_ID_PTR pxSlotId = NULL;
-    CK_ULONG ulSlotCount = 0;
-    CK_TOKEN_INFO xTokenInfo = { 0 };
-    int i = 0;
-
-    xResult = C_GetFunctionList( &pxFunctionList );
-
-    /* Check for a private key. */
-    if( CKR_OK == xResult )
-    {
-        xResult = xFindObjectWithLabelAndClass( xSession,
-                                                pkcs11configLABEL_DEVICE_PRIVATE_KEY_FOR_TLS,
-                                                CKO_PRIVATE_KEY,
-                                                &pxProvisionedState->xPrivateKey );
-    }
-
-    if( ( CKR_OK == xResult ) && ( CK_INVALID_HANDLE != pxProvisionedState->xPrivateKey ) )
-    {
-        /* Check also for the corresponding public. */
-        xResult = xFindObjectWithLabelAndClass( xSession,
-                                                pkcs11configLABEL_DEVICE_PUBLIC_KEY_FOR_TLS,
-                                                CKO_PUBLIC_KEY,
-                                                &pxProvisionedState->xPublicKey );
-    }
-
-    if( ( CKR_OK == xResult ) && ( CK_INVALID_HANDLE != pxProvisionedState->xPublicKey ) )
-    {
-        /* Export the public key. */
-        xResult = prvExportPublicKey( xSession,
-                                      pxProvisionedState->xPublicKey,
-                                      &pxProvisionedState->pucDerPublicKey,
-                                      &pxProvisionedState->ulDerPublicKeyLength );
-    }
-
-    /* Check for the client certificate. */
-    if( CKR_OK == xResult )
-    {
-        xResult = xFindObjectWithLabelAndClass( xSession,
-                                                pkcs11configLABEL_DEVICE_CERTIFICATE_FOR_TLS,
-                                                CKO_CERTIFICATE,
-                                                &pxProvisionedState->xClientCertificate );
-    }
-
-    /* Check for a crypto element identifier. */
-    if( CKR_OK == xResult )
-    {
-        xResult = xGetSlotList( &pxSlotId, &ulSlotCount );
-    }
-
-    if( CKR_OK == xResult )
-    {
-        xResult = pxFunctionList->C_GetTokenInfo( pxSlotId[ 0 ], &xTokenInfo );
-    }
-
-    if( ( CKR_OK == xResult ) && ( '\0' != xTokenInfo.label[ 0 ] ) && ( ' ' != xTokenInfo.label[ 0 ] ) )
-    {
-        /* PKCS #11 requires that token info fields are padded out with space
-         * characters. However, a NULL terminated copy will be more useful to the
-         * caller. */
-        for( i = 0; i < sizeof( xTokenInfo.label ); i++ )
-        {
-            if( xTokenInfo.label[ i ] == ' ' )
-            {
-                break;
-            }
-        }
-
-        if( 0 != i )
-        {
-            pxProvisionedState->pcIdentifier = ( char * ) pvPortMalloc( 1 + i * sizeof( xTokenInfo.label[ 0 ] ) );
-
-            if( NULL != pxProvisionedState->pcIdentifier )
-            {
-                memcpy( pxProvisionedState->pcIdentifier,
-                        xTokenInfo.label,
-                        i );
-                pxProvisionedState->pcIdentifier[ i ] = '\0';
-            }
-            else
-            {
-                xResult = CKR_HOST_MEMORY;
-            }
-        }
-    }
-
-    return xResult;
-}
 
 /*-----------------------------------------------------------*/
 
@@ -994,6 +908,175 @@ static void prvWriteHexBytesToConsole( char * pcDescription,
 }
 
 /*-----------------------------------------------------------*/
+/*static CK_RV prvExportCertificate( CK_SESSION_HANDLE xSession, */
+/*    CK_OBJECT_HANDLE xCertificateHandle, */
+/*    uint8_t ** ppucDerCertificate, */
+/*    uint32_t * pulDerCertificateLength ) */
+/*{ */
+/*    CK_RV xResult; */
+/*    CK_FUNCTION_LIST_PTR pxFunctionList; */
+/*    CK_ATTRIBUTE xTemplate = { 0 }; */
+/* */
+/* */
+/*    xResult = C_GetFunctionList( &pxFunctionList ); */
+/* */
+/*    / * Scope to ECDSA keys only, since there's currently no use case for */
+/*     * onboard keygen and certificate enrollment for RSA. * / */
+/*    if ( (CKR_OK == xResult)  ) */
+/*    { */
+/*        / * Query the size of the certificate key. * / */
+/*        xTemplate.type = CKA_VALUE; */
+/*        xTemplate.pValue = NULL; */
+/*        xTemplate.ulValueLen = 0; */
+/*        xResult = pxFunctionList->C_GetAttributeValue( xSession, */
+/*            xCertificateHandle, */
+/*            &xTemplate, */
+/*            1 ); */
+/* */
+/*        / * Allocate a buffer large enough for the full, encoded public key. * / */
+/*        if ( CKR_OK == xResult ) */
+/*        { */
+/*            / * Add space for the full DER header. * / */
+/*            xTemplate.ulValueLen += sizeof( pucEcP256AsnAndOid ) - sizeof( pucUnusedKeyTag ); */
+/*            *pulDerCertificateLength = xTemplate.ulValueLen; */
+/* */
+/*            / * Get a heap buffer. * / */
+/*            *ppucDerCertificate = pvPortMalloc( xTemplate.ulValueLen ); */
+/* */
+/*            / * Check for resource exhaustion. * / */
+/*            if ( NULL == *ppucDerCertificate ) */
+/*            { */
+/*                xResult = CKR_HOST_MEMORY; */
+/*            } */
+/*        } */
+/* */
+/*        / * Export the public key. * / */
+/*        if ( CKR_OK == xResult ) */
+/*        { */
+/*            xTemplate.pValue = *ppucDerCertificate + sizeof( pucEcP256AsnAndOid ) - sizeof( pucUnusedKeyTag ); */
+/*            xTemplate.ulValueLen -= (sizeof( pucEcP256AsnAndOid ) - sizeof( pucUnusedKeyTag )); */
+/*            xResult = pxFunctionList->C_GetAttributeValue( xSession, */
+/*                xCertificateHandle, */
+/*                &xTemplate, */
+/*                1 ); */
+/*        } */
+/* */
+/*        / * Prepend the full DER header. * / */
+/*        if ( CKR_OK == xResult ) */
+/*        { */
+/*            memcpy( *ppucDerCertificate, pucEcP256AsnAndOid, sizeof( pucEcP256AsnAndOid ) ); */
+/*        } */
+/*    } */
+/* */
+/*    / * Free memory if there was an error after allocation. * / */
+/*    if ( (NULL != *ppucDerCertificate) && (CKR_OK != xResult) ) */
+/*    { */
+/*        vPortFree( *ppucDerCertificate ); */
+/*        *ppucDerCertificate = NULL; */
+/*    } */
+/* */
+/*    return xResult; */
+/*} */
+
+/* Determine which required client crypto objects are already present in
+ * storage. */
+static CK_RV prvGetProvisionedState( CK_SESSION_HANDLE xSession,
+                                     ProvisionedState_t * pxProvisionedState )
+{
+    CK_RV xResult;
+    CK_FUNCTION_LIST_PTR pxFunctionList;
+    CK_SLOT_ID_PTR pxSlotId = NULL;
+    CK_ULONG ulSlotCount = 0;
+    CK_TOKEN_INFO xTokenInfo = { 0 };
+    int i = 0;
+
+    xResult = C_GetFunctionList( &pxFunctionList );
+
+    /* Check for a private key. */
+    if( CKR_OK == xResult )
+    {
+        xResult = xFindObjectWithLabelAndClass( xSession,
+                                                pkcs11configLABEL_DEVICE_PRIVATE_KEY_FOR_TLS,
+                                                CKO_PRIVATE_KEY,
+                                                &pxProvisionedState->xPrivateKey );
+    }
+
+    if( ( CKR_OK == xResult ) && ( CK_INVALID_HANDLE != pxProvisionedState->xPrivateKey ) )
+    {
+        DEV_MODE_KEY_PROVISIONING_PRINT( ( "Device Private Key Exists. \r\n" ) );
+        /* Check also for the corresponding public. */
+        xResult = xFindObjectWithLabelAndClass( xSession,
+                                                pkcs11configLABEL_DEVICE_PUBLIC_KEY_FOR_TLS,
+                                                CKO_PUBLIC_KEY,
+                                                &pxProvisionedState->xPublicKey );
+    }
+
+    if( ( CKR_OK == xResult ) && ( CK_INVALID_HANDLE != pxProvisionedState->xPublicKey ) )
+    {
+        DEV_MODE_KEY_PROVISIONING_PRINT( ( "Device Public Key Exists. \r\n" ) );
+        /* Export the public key. */
+        xResult = prvExportPublicKey( xSession,
+                                      pxProvisionedState->xPublicKey,
+                                      &pxProvisionedState->pucDerPublicKey,
+                                      &pxProvisionedState->ulDerPublicKeyLength );
+        prvWriteHexBytesToConsole( "Device public key",
+                                   pxProvisionedState->pucDerPublicKey,
+                                   pxProvisionedState->ulDerPublicKeyLength );
+    }
+
+    /* Check for the client certificate. */
+    if( CKR_OK == xResult )
+    {
+        xResult = xFindObjectWithLabelAndClass( xSession,
+                                                pkcs11configLABEL_DEVICE_CERTIFICATE_FOR_TLS,
+                                                CKO_CERTIFICATE,
+                                                &pxProvisionedState->xClientCertificate );
+    }
+
+    /* Check for a crypto element identifier. */
+    if( CKR_OK == xResult )
+    {
+        xResult = xGetSlotList( &pxSlotId, &ulSlotCount );
+    }
+
+    if( CKR_OK == xResult )
+    {
+        xResult = pxFunctionList->C_GetTokenInfo( pxSlotId[ 0 ], &xTokenInfo );
+    }
+
+    if( ( CKR_OK == xResult ) && ( '\0' != xTokenInfo.label[ 0 ] ) && ( ' ' != xTokenInfo.label[ 0 ] ) )
+    {
+        /* PKCS #11 requires that token info fields are padded out with space
+         * characters. However, a NULL terminated copy will be more useful to the
+         * caller. */
+        for( i = 0; i < sizeof( xTokenInfo.label ); i++ )
+        {
+            if( xTokenInfo.label[ i ] == ' ' )
+            {
+                break;
+            }
+        }
+
+        if( 0 != i )
+        {
+            pxProvisionedState->pcIdentifier = ( char * ) pvPortMalloc( 1 + i * sizeof( xTokenInfo.label[ 0 ] ) );
+
+            if( NULL != pxProvisionedState->pcIdentifier )
+            {
+                memcpy( pxProvisionedState->pcIdentifier,
+                        xTokenInfo.label,
+                        i );
+                pxProvisionedState->pcIdentifier[ i ] = '\0';
+            }
+            else
+            {
+                xResult = CKR_HOST_MEMORY;
+            }
+        }
+    }
+
+    return xResult;
+}
 
 /* Attempt to provision the device with a client certificate, associated
  * private and public key pair, and optional Just-in-Time Registration certificate.
@@ -1220,6 +1303,7 @@ CK_RV vAlternateKeyProvisioning( ProvisioningParams_t * xParams )
 
 /*-----------------------------------------------------------*/
 
+
 /* Perform device provisioning using the default TLS client credentials. */
 CK_RV vDevModeKeyProvisioning( void )
 {
@@ -1274,3 +1358,965 @@ CK_RV vDevModeKeyProvisioning( void )
 }
 
 /*-----------------------------------------------------------*/
+
+//CK_SESSION_HANDLE xSession = CK_INVALID_HANDLE;
+//CK_FUNCTION_LIST_PTR pxFunctionList = NULL;
+//CK_OBJECT_HANDLE xPrivateKeyHandle = CK_INVALID_HANDLE;
+//CK_OBJECT_HANDLE xPublicKeyHandle = CK_INVALID_HANDLE;
+
+CK_RV vGenerateECDSAKeyPair( void )
+{
+    CK_RV xResult = CKR_OK;
+  CK_SESSION_HANDLE xSession = CK_INVALID_HANDLE;
+CK_FUNCTION_LIST_PTR pxFunctionList = NULL;
+CK_OBJECT_HANDLE xPrivateKeyHandle = CK_INVALID_HANDLE;
+CK_OBJECT_HANDLE xPublicKeyHandle = CK_INVALID_HANDLE;
+
+    CK_BYTE_PTR pxPublicKeyBytes = NULL;
+    size_t xPublicKeyLength = 0;
+
+    xResult = C_GetFunctionList( &pxFunctionList );
+
+    /* Initialize the PKCS Module */
+    if( xResult == CKR_OK )
+    {
+        xResult = xInitializePkcs11Token();
+    }
+
+    if( xResult == CKR_OK )
+    {
+        xResult = xInitializePkcs11Session( &xSession );
+    }
+
+    if( xResult == CKR_OK )
+    {
+        /* Generate a new ECDSA key pair using curve P256. */
+        xResult = xProvisionGenerateKeyPairEC( xSession,
+                                               pkcs11configLABEL_DEVICE_PRIVATE_KEY_FOR_TLS,
+                                               pkcs11configLABEL_DEVICE_PUBLIC_KEY_FOR_TLS,
+                                               &xPrivateKeyHandle,
+                                               &xPublicKeyHandle );
+    }
+
+    if( ( xResult == CKR_OK ) && ( xPrivateKeyHandle != CK_INVALID_HANDLE ) && ( xPublicKeyHandle != CK_INVALID_HANDLE ) )
+    {
+        /* Get the bytes of the new public key. */
+        xResult = prvExportPublicKey( xSession,
+                                      xPublicKeyHandle,
+                                      &pxPublicKeyBytes,
+                                      &xPublicKeyLength );
+
+        if( xResult == CKR_OK )
+        {
+            /* Print the public key to the console. */
+            prvWriteHexBytesToConsole( "\r\nDevice public key",
+                                       pxPublicKeyBytes,
+                                       xPublicKeyLength );
+
+            vPortFree( pxPublicKeyBytes );
+        }
+    }
+
+    if( xResult == CKR_OK )
+    {
+        xResult = pxFunctionList->C_CloseSession( xSession );
+    }
+
+    return xResult;
+}
+
+
+/* GLOBAL VARIABLES */
+CK_SESSION_HANDLE xGlobalSession;
+CK_RV xResult;
+
+CK_OBJECT_HANDLE xPrivateKeyHandle = CK_INVALID_HANDLE;
+CK_OBJECT_HANDLE xPublicKeyHandle = CK_INVALID_HANDLE;
+CK_FUNCTION_LIST_PTR pxGlobalFunctionList;
+
+/*-----------------------------------------------------------*/
+
+/* Declaration of demo function. */
+void vStartKeyProvisioningDemo( void );
+
+/*-----------------------------------------------------------*/
+
+
+/* @brief Random Number Generator Used to Generate CSR
+ *
+ *
+ *	\param[in] pkcs_session     Pointer to PKCS Session Handle
+ *
+ *  \param[in] pucRandom        Starting Point
+ *
+ *  \param[in] xRandomLength    Length
+ *
+ *  \return 0 on success
+ *
+ */
+static int prvRNG( void * pkcs_session,
+    unsigned char * pucRandom,
+    size_t xRandomLength )
+{
+    BaseType_t xResult;
+    CK_FUNCTION_LIST_PTR pxP11FunctionList;
+
+    xResult = C_GetFunctionList( &pxP11FunctionList );
+
+    xResult = pxP11FunctionList->C_GenerateRandom( (*(( CK_SESSION_HANDLE * ) pkcs_session)), pucRandom, xRandomLength );
+
+    if ( xResult != 0 )
+    {
+        configPRINTF( ("ERROR: Failed to generate random bytes %d \r\n", xResult) );
+      
+    }
+
+    return xResult;
+}
+
+/*-----------------------------------------------------------*/
+
+/* @brief Alternate Signing Function to be Passed into PK Context Header
+ * This function was copied from "iot_tls.c"
+ * Recreated to be passed into a PK Context header as our customized signing function.
+ * */
+static int prvPrivateKeySigningCallback( void * pvContext,
+    mbedtls_md_type_t xMdAlg,
+    const unsigned char * pucHash,
+    size_t xHashLen,
+    unsigned char * pucSig,
+    size_t * pxSigLen,
+    int( *piRng )(void *,
+        unsigned char *,
+        size_t), /*lint !e955 This parameter is unused. */
+    void * pvRng )
+{
+    CK_RV xResult = 0;
+    int lFinalResult = 0;
+    CK_MECHANISM xMech = { 0 };
+    CK_BYTE xToBeSigned[ 256 ];
+    uint8_t ucTemp[ 64 ] = { 0 }; /* A temporary buffer for the pre-formatted signature. */
+    CK_ULONG xToBeSignedLen = sizeof( xToBeSigned );
+
+
+    /* Unreferenced parameters. */
+    ( void ) (piRng);
+    ( void ) (pvRng);
+    ( void ) (xMdAlg);
+
+    /* Sanity check buffer length. */
+    if ( xHashLen > sizeof( xToBeSigned ) )
+    {
+        xResult = CKR_ARGUMENTS_BAD;
+    }
+
+    xMech.mechanism = CKM_ECDSA;
+    memcpy( xToBeSigned, pucHash, xHashLen );
+    xToBeSignedLen = xHashLen;
+
+    if ( 0 == xResult )
+    {
+        /* Use the PKCS#11 module to sign. */
+        xResult = pxGlobalFunctionList->C_SignInit( xGlobalSession,
+            &xMech,
+            xPrivateKeyHandle );
+    }
+
+    if ( 0 == xResult )
+    {
+        *pxSigLen = sizeof( xToBeSigned );
+        xResult = pxGlobalFunctionList->C_Sign( ( CK_SESSION_HANDLE ) xGlobalSession,
+            xToBeSigned,
+            xToBeSignedLen,
+            pucSig,
+            ( CK_ULONG_PTR ) pxSigLen );
+    }
+
+    uint8_t * pucSigPtr;
+
+    /* PKCS #11 for P256 returns a 64-byte signature with 32 bytes for R and 32 bytes for S.
+     * This must be converted to an ASN1 encoded array. */
+    configASSERT( *pxSigLen == 64 );
+    memcpy( ucTemp, pucSig, *pxSigLen );
+
+    pucSig[ 0 ] = 0x30; /* Sequence. */
+    pucSig[ 1 ] = 0x44; /* The minimum length the signature could be. */
+    pucSig[ 2 ] = 0x02; /* Integer. */
+
+    if ( ucTemp[ 0 ] & 0x80 )
+    {
+        pucSig[ 1 ]++;
+        pucSig[ 3 ] = 0x21;
+        pucSig[ 4 ] = 0x0;
+        memcpy( &pucSig[ 5 ], ucTemp, 32 );
+        pucSigPtr = pucSig + 33 + 4;
+    }
+    else
+    {
+        pucSig[ 3 ] = 0x20;
+        memcpy( &pucSig[ 4 ], ucTemp, 32 );
+        pucSigPtr = pucSig + 32 + 4;
+    }
+
+    pucSigPtr[ 0 ] = 0x02; /* Integer. */
+    pucSigPtr++;
+
+    if ( ucTemp[ 32 ] & 0x80 )
+    {
+        pucSig[ 1 ]++;
+        pucSigPtr[ 0 ] = 0x21;
+        pucSigPtr[ 1 ] = 0x00;
+        pucSigPtr += 2;
+
+        memcpy( pucSigPtr, &ucTemp[ 32 ], 32 );
+    }
+    else
+    {
+        pucSigPtr[ 0 ] = 0x20;
+        pucSigPtr++;
+        memcpy( pucSigPtr, &ucTemp[ 32 ], 32 );
+    }
+
+    *pxSigLen = ( CK_ULONG ) pucSig[ 1 ] + 2;
+
+    if ( xResult != 0 )
+    {
+        configPRINTF( ("ERROR: Failure in signing callback: %d \r\n", xResult) );
+    }
+
+    return lFinalResult;
+}
+
+/*-----------------------------------------------------------*/
+
+/* @brief Provision Device Using Device and CA Certificates
+ *
+ *
+ *	\return    Void
+ *  Prints error message upon failure, success message upon success
+ *
+ */
+static int xProvisionDeviceForJITP( void )
+{
+    /* Provisioning Device Certificate */
+    CK_OBJECT_HANDLE xObject = 0;
+
+    xResult = xProvisionCertificate( xGlobalSession,
+        keyCLIENT_CERTIFICATE_PEM,
+        sizeof( keyCLIENT_CERTIFICATE_PEM ),
+        ( uint8_t * ) pkcs11configLABEL_DEVICE_CERTIFICATE_FOR_TLS,
+        &xObject );
+
+    if ( (xResult != CKR_OK) || (xObject == CK_INVALID_HANDLE) )
+    {
+        configPRINTF( ("ERROR: Failed to provision device certificate. %d \r\n", xResult) );
+        return -1;
+    }
+
+    /* Provisioning JITR CA Certificate */
+    if ( xResult == CKR_OK )
+    {
+        if ( sizeof( keyJITR_DEVICE_CERTIFICATE_AUTHORITY_PEM ) != 0 )
+        {
+            xResult = xProvisionCertificate( xGlobalSession,
+                keyJITR_DEVICE_CERTIFICATE_AUTHORITY_PEM,
+                sizeof( keyJITR_DEVICE_CERTIFICATE_AUTHORITY_PEM ),
+                ( uint8_t * ) pkcs11configLABEL_JITP_CERTIFICATE,
+                &xObject );
+
+            xResult = CKR_OK;
+        }
+    }
+
+    if ( xResult == CKR_OK )
+    {
+        configPRINTF( ("Device credential provisioning succeeded.\r\n") );
+        return 0;
+    }
+    else
+    {
+        configPRINTF( ("ERROR: %d - Device credential provisioning failed.\r\n", xResult) );
+        return -1;
+    }
+}
+
+/*-----------------------------------------------------------*/
+
+/* @brief Provisions a Device Using Internally Generated Keys
+ *
+ *
+ *  \return Void function, console outputs upon success/failure
+ *
+ */
+int xDeviceProvisioningForJITP( void )
+{
+    xResult = xInitializePkcs11Session( &xGlobalSession );
+
+    BaseType_t xHeapBefore;
+    BaseType_t xHeapAfter;
+
+    /* xHeapBefore = xPortGetFreeHeapSize(); */
+    /* configPRINTF(("Heap size before is %d", xHeapBefore)); */
+
+    if ( xResult == CKR_OK )
+    {
+        xResult = C_GetFunctionList( &pxGlobalFunctionList );
+    }
+    else
+    {
+        configPRINTF( ("ERROR: %d - Failed to open PKCS #11 session.\r\n", xResult) );
+    }
+
+    if ( xResult != CKR_OK )
+    {
+        configPRINTF( ("ERROR: %d - Failed to get function list.\r\n", xResult) );
+    }
+
+#if ( !DEMO_PART && xResult == CKR_OK )
+    {
+        CK_BYTE xHashedMessage[ pkcs11SHA256_DIGEST_LENGTH ] = { 0xab };
+        CK_MECHANISM xMechanism;
+        CK_BYTE xSignature[ pkcs11RSA_2048_SIGNATURE_LENGTH ] = { 0 };
+        CK_BYTE xEcPoint[ 256 ] = { 0 };
+        CK_KEY_TYPE xKeyType;
+        CK_ULONG xSignatureLength;
+        CK_ATTRIBUTE xTemplate;
+        CK_OBJECT_CLASS xClass;
+
+        /* mbedTLS structures for verification. */
+        int lMbedTLSResult;
+        int ret;
+        mbedtls_ecdsa_context xEcdsaContext;
+
+        //xResult = xDestroyCredentials( xGlobalSession );
+
+        if ( xResult == CKR_OK )
+        {
+            xResult = xProvisionGenerateKeyPairEC( xGlobalSession,
+                ( uint8_t * ) pkcs11configLABEL_DEVICE_PRIVATE_KEY_FOR_TLS,
+                ( uint8_t * ) pkcs11configLABEL_DEVICE_PUBLIC_KEY_FOR_TLS,
+                &xPrivateKeyHandle,
+                &xPublicKeyHandle );
+        }
+        else
+        {
+            configPRINTF( ("ERROR: %d - Failed to destroy credentials before Generating Key Pair.\r\n", xResult) );
+        }
+
+        if ( xPrivateKeyHandle == CK_INVALID_HANDLE )
+        {
+            configPRINTF( ("ERROR: %d - Invalid private key handle generated by GenerateKeyPair.\r\n", xPrivateKeyHandle) );
+        }
+
+        if ( xPublicKeyHandle == CK_INVALID_HANDLE )
+        {
+            configPRINTF( ("ERROR: %d - Invalid public key handle generated by GenerateKeyPair.\r\n", xPublicKeyHandle) );
+        }
+
+        /* Call GetAttributeValue to retrieve information about the keypair stored. */
+        /* Check that correct object class retrieved. */
+        xTemplate.type = CKA_CLASS;
+        xTemplate.pValue = NULL;
+        xTemplate.ulValueLen = 0;
+
+        if ( xResult == CKR_OK )
+        {
+            xResult = pxGlobalFunctionList->C_GetAttributeValue( xGlobalSession, xPublicKeyHandle, &xTemplate, 1 );
+        }
+        else
+        {
+            configPRINTF( ("ERROR: %d - Generating EC key pair failed.", xResult) );
+        }
+
+        if ( xTemplate.ulValueLen != sizeof( CK_OBJECT_CLASS ) )
+        {
+            configPRINTF( ("Incorrect object class length returned from GetAttributeValue.\r\n") );
+        }
+
+        xTemplate.pValue = &xClass;
+
+        if ( xResult == CKR_OK )
+        {
+            xResult = pxGlobalFunctionList->C_GetAttributeValue( xGlobalSession, xPrivateKeyHandle, &xTemplate, 1 );
+        }
+        else
+        {
+            configPRINTF( ("ERROR: %d - GetAttributeValue for length of public EC key class failed.\r\n", xResult) );
+        }
+
+        if ( xClass != CKO_PRIVATE_KEY )
+        {
+            configPRINTF( ("ERROR: %d - Incorrect object class returned from GetAttributeValue.\r\n", xClass) );
+        }
+
+        xTemplate.pValue = &xClass;
+
+        if ( xResult == CKR_OK )
+        {
+            xResult = pxGlobalFunctionList->C_GetAttributeValue( xGlobalSession, xPublicKeyHandle, &xTemplate, 1 );
+        }
+        else
+        {
+            configPRINTF( ("ERROR: %d - GetAttributeValue for private EC key class failed.\r\n", xResult) );
+        }
+
+        if ( xClass != CKO_PUBLIC_KEY )
+        {
+            configPRINTF( ("ERROR: %d - Incorrect object class returned from GetAttributeValue.\r\n", xClass) );
+        }
+
+        /* Check that both keys are stored as EC Keys. */
+        xTemplate.type = CKA_KEY_TYPE;
+        xTemplate.pValue = &xKeyType;
+        xTemplate.ulValueLen = sizeof( CK_KEY_TYPE );
+
+        if ( xResult == CKR_OK )
+        {
+            xResult = pxGlobalFunctionList->C_GetAttributeValue( xGlobalSession, xPrivateKeyHandle, &xTemplate, 1 );
+        }
+        else
+        {
+            configPRINTF( ("ERROR: %d - GetAttributeValue for public EC key class failed.\r\n", xResult) );
+        }
+
+        if ( xTemplate.ulValueLen != sizeof( CK_KEY_TYPE ) )
+        {
+            configPRINTF( ("Length of key type incorrect in GetAttributeValue.\r\n") );
+        }
+
+        if ( xKeyType != CKK_EC )
+        {
+            configPRINTF( ("ERROR: %d - Incorrect key type for private key.\r\n", xKeyType) );
+        }
+
+        if ( xResult == CKR_OK )
+        {
+            xResult = pxGlobalFunctionList->C_GetAttributeValue( xGlobalSession, xPublicKeyHandle, &xTemplate, 1 );
+        }
+        else
+        {
+            configPRINTF( ("ERROR: %d - Error getting attribute value of EC key type.\r\n", xResult) );
+        }
+
+        if ( xTemplate.ulValueLen != sizeof( CK_KEY_TYPE ) )
+        {
+            configPRINTF( ("Length of key type incorrect in GetAttributeValue.\r\n") );
+        }
+
+        if ( xKeyType != CKK_EC )
+        {
+            configPRINTF( ("ERROR: %d - Incorrect key type for public key.\r\n", xKeyType) );
+        }
+
+        /* Check that public key point can be retrieved for public key. */
+        xTemplate.type = CKA_EC_POINT;
+        xTemplate.pValue = xEcPoint;
+        xTemplate.ulValueLen = sizeof( xEcPoint );
+
+        if ( xResult == CKR_OK )
+        {
+            xResult = pxGlobalFunctionList->C_GetAttributeValue( xGlobalSession, xPublicKeyHandle, &xTemplate, 1 );
+        }
+        else
+        {
+            configPRINTF( ("ERROR: %d - Error getting attribute value of EC key type.\r\n", xResult) );
+        }
+
+        /* Perform a sign with the generated private key. */
+        xMechanism.mechanism = CKM_ECDSA;
+        xMechanism.pParameter = NULL;
+        xMechanism.ulParameterLen = 0;
+
+        if ( xResult == CKR_OK )
+        {
+            xResult = pxGlobalFunctionList->C_SignInit( xGlobalSession, &xMechanism, xPrivateKeyHandle );
+        }
+        else
+        {
+            configPRINTF( ("ERROR: %d - Failed to retrieve EC Point.\r\n", xResult) );
+        }
+
+        xSignatureLength = sizeof( xSignature );
+
+        if ( xResult == CKR_OK )
+        {
+            xResult = pxGlobalFunctionList->C_Sign( xGlobalSession, xHashedMessage, pkcs11SHA256_DIGEST_LENGTH, xSignature, &xSignatureLength );
+        }
+        else
+        {
+            configPRINTF( ("ERROR: %d - Failed to SignInit ECDSA.\r\n", xResult) );
+        }
+
+        if ( xResult != CKR_OK )
+        {
+            configPRINTF( ("ERROR: %d - Failed to ECDSA Sign.\r\n", xResult) );
+        }
+
+        /* Verify the signature with mbedTLS */
+        mbedtls_ecdsa_init( &xEcdsaContext );
+        mbedtls_ecp_group_init( &xEcdsaContext.grp );
+
+
+        /*//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////// */
+        mbedtls_mpi xR;
+        mbedtls_mpi xS;
+
+        lMbedTLSResult = mbedtls_ecp_group_load( &xEcdsaContext.grp, MBEDTLS_ECP_DP_SECP256R1 );
+
+        if ( lMbedTLSResult == 0 )
+        {
+            /* The first 2 bytes are for ASN1 type/length encoding. */
+            lMbedTLSResult = mbedtls_ecp_point_read_binary( &xEcdsaContext.grp, &xEcdsaContext.Q, &xEcPoint[ 2 ], xTemplate.ulValueLen - 2 );
+        }
+        else
+        {
+            configPRINTF( ("ERROR: %d - mbedTLS failed in setup for signature verification.\r\n", lMbedTLSResult) );
+        }
+
+        /* C_Sign returns the R & S components one after another- import these into a format that mbedTLS can work with. */
+        mbedtls_mpi_init( &xR );
+        mbedtls_mpi_init( &xS );
+
+        if ( lMbedTLSResult == 0 )
+        {
+            lMbedTLSResult = mbedtls_mpi_read_binary( &xR, &xSignature[ 0 ], 32 );
+        }
+        else
+        {
+            configPRINTF( ("ERROR: %d - mbedTLS failed in setup for signature verification.\r\n", lMbedTLSResult) );
+        }
+
+        if ( lMbedTLSResult == 0 )
+        {
+            lMbedTLSResult = mbedtls_mpi_read_binary( &xS, &xSignature[ 32 ], 32 );
+        }
+        else
+        {
+            configPRINTF( ("ERROR: %d - mbedTLS failed in setup for signature verification.\r\n", lMbedTLSResult) );
+        }
+
+        if ( lMbedTLSResult == 0 )
+        {
+            /* Verify using mbedTLS & exported public key. */
+            lMbedTLSResult = mbedtls_ecdsa_verify( &xEcdsaContext.grp, xHashedMessage, sizeof( xHashedMessage ), &xEcdsaContext.Q, &xR, &xS );
+        }
+        else
+        {
+            configPRINTF( ("ERROR: %d - mbedTLS failed in setup for signature verification.\r\n", lMbedTLSResult) );
+        }
+
+        if ( lMbedTLSResult != 0 )
+        {
+            configPRINTF( ("ERROR: %d - mbedTLS failed to verify signature.\r\n", lMbedTLSResult) );
+        }
+
+        /* Verify the signature with the generated public key. */
+        xResult = pxGlobalFunctionList->C_VerifyInit( xGlobalSession, &xMechanism, xPublicKeyHandle );
+
+        if ( xResult == CKR_OK )
+        {
+            xResult = pxGlobalFunctionList->C_Verify( xGlobalSession, xHashedMessage, pkcs11SHA256_DIGEST_LENGTH, xSignature, xSignatureLength );
+        }
+        else
+        {
+            configPRINTF( ("ERROR: %d - Failed to VerifyInit ECDSA.\r\n", xResult) );
+        }
+
+        if ( xResult != CKR_OK )
+        {
+            configPRINTF( ("ERROR: %d - Failed to Verify ECDSA.\r\n", xResult) );
+        }
+
+        mbedtls_mpi_free( &xR );
+        mbedtls_mpi_free( &xS );
+
+        /*//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////// */
+
+
+        /* Generate a PK Context for CSR */
+        /* Getting header info from ECKEY type */
+        mbedtls_pk_type_t type_key = MBEDTLS_PK_ECKEY;
+        const mbedtls_pk_info_t * header = mbedtls_pk_info_from_type( type_key );
+
+        /* Creating copy of header to pass in custom sign function (original header is immutable) */
+        mbedtls_pk_info_t * header_copy = pvPortMalloc( sizeof( mbedtls_pk_info_t ) );
+
+        if ( header_copy == NULL )
+        {
+            configPRINTF( ("ERROR: Failed to allocate memory for header_copy variable. CSR cannot be generated\r\n") );
+            return;
+        }
+
+        memcpy( header_copy, header, sizeof( struct mbedtls_pk_info_t ) );
+
+        header_copy->sign_func = &prvPrivateKeySigningCallback;
+
+        /* Initializing PK Context */
+        mbedtls_pk_context pk_cont;
+        mbedtls_pk_init( &pk_cont );
+        ret = mbedtls_pk_setup( &pk_cont, header_copy );
+
+        pk_cont.pk_ctx = &xEcdsaContext;
+
+
+        /* Generating CSR */
+        /* Initializing CSR Context */
+        mbedtls_x509write_csr my_csr;
+        mbedtls_x509write_csr_init( &my_csr );
+
+        if ( ret == 0 )
+        {
+            ret = mbedtls_x509write_csr_set_subject_name( &my_csr, "CN=ThingName" ); /* This name is configurable to your personal thing name. */
+        }
+        else
+        {
+            configPRINTF( ("ERROR: %d - Failed to initialize PK context with given information.\r\n", ret) );
+        }
+
+        mbedtls_x509write_csr_set_key( &my_csr, &pk_cont );
+        mbedtls_x509write_csr_set_md_alg( &my_csr, MBEDTLS_MD_SHA256 );
+
+        if ( ret == 0 )
+        {
+            ret = mbedtls_x509write_csr_set_key_usage( &my_csr, MBEDTLS_X509_KU_DIGITAL_SIGNATURE );
+        }
+        else
+        {
+            configPRINTF( ("ERROR: %d - Failed to set subject name of CSR context.\r\n", ret) );
+        }
+
+        if ( ret == 0 )
+        {
+            ret = mbedtls_x509write_csr_set_ns_cert_type( &my_csr, MBEDTLS_X509_NS_CERT_TYPE_SSL_CLIENT );
+        }
+        else
+        {
+            configPRINTF( ("ERROR: %d - Failed to set key usage of CSR context.\r\n", ret) );
+        }
+
+        /* Output Buffer */
+        unsigned char * final_csr = pvPortMalloc( 2000 );
+
+        if ( final_csr == NULL )
+        {
+            configPRINTF( ("ERROR: Failed to allocate memory for final_csr variable. CSR cannot be generated\r\n") );
+            return;
+        }
+
+        size_t len_buf = ( size_t ) 2000;
+
+        if ( ret == 0 )
+        {
+            ret = mbedtls_x509write_csr_pem( &my_csr, final_csr, len_buf, &prvRNG, &xGlobalSession );
+        }
+        else
+        {
+            configPRINTF( ("ERROR: %d - Failed to set NS Cert Type of CSR context.\r\n", ret) );
+        }
+
+        if ( ret != 0 )
+        {
+            configPRINTF( ("ERROR: %d - Failed to write CSR.\r\n", ret) );
+        }
+
+        /* Console Outputs */
+        unsigned char * csr_message = "Copy the following Certificate Signing Request into tools/reinvent_demo/device.csr :";
+        unsigned char * script_message = "2) ONCE YOU'VE COPIED THE CERTIFICATE REQUEST, PLEASE RUN THE SCRIPT NAMED\n\t\t\"device_cert.h\" LOCATED IN tools/create_certs";
+        unsigned char * cert_message = "3) ONCE YOU HAVE COMPLETED RUNNING THE SCRIPT, OPEN \"aws_clientcrediental_keys.h\" AND:"                                                                  \
+            "\n\ta) FORMAT THE TWO CERTIFICATES LOCATED IN tools/create_certs/deviceCertAndCACert.crt\n\t\tUSING tools/certificate_configuration/PEMfileToCString.html" \
+            "\n\tb) PASTE THE RESULTING TWO C STRINGS INTO\n\t\tkeyCLIENT_CERTIFICATE_PEM AND keyJITR_DEVICE_CERTIFICATE_AUTHORITY_PEM, RESPECTIVELY,\n\t\tIN \"aws_clientcrediental_keys.h\"";
+
+        configPRINTF( ("\n\n%s\n\n%s\n", csr_message, final_csr) );
+
+        /* Freeing Memory */
+        mbedtls_ecp_group_free( &xEcdsaContext.grp );
+        mbedtls_ecdsa_free( &xEcdsaContext );
+        /*mbedtls_pk_free( &pk_cont ); */
+        /*header_copy->ctx_free_func( &pk_cont ); */
+        mbedtls_x509write_csr_free( &my_csr );
+        vPortFree( final_csr );
+
+        /* xHeapAfter = xPortGetFreeHeapSize(); */
+        /* configPRINTF(("Heap size before is %d", xHeapAfter)); */
+        while ( 1 );
+
+        return(xResult || lMbedTLSResult || ret);
+
+
+    }
+#else /* if ( !DEMO_PART ) */
+    {
+        /* Provision device using certificates in aws_clientcredential_keys.h */
+        int ret = xProvisionDeviceForJITP();
+
+        if ( ret != 0 )
+        {
+            configPRINTF( ("ERROR: %d - Provisioning Function Failed.\r\n", ret) );
+        }
+    }
+#endif /* if ( !DEMO_PART ) */
+}
+
+///* @brief Random Number Generator Used to Generate CSR
+// *
+// *
+// *	\param[in] pkcs_session     Pointer to PKCS Session Handle
+// *
+// *  \param[in] pucRandom        Starting Point
+// *
+// *  \param[in] xRandomLength    Length
+// *
+// *  \return 0 on success
+// *
+// */
+//static int prvRNG( void * pkcs_session,
+//                   unsigned char * pucRandom,
+//                   size_t xRandomLength )
+//{
+//    BaseType_t xResult;
+//
+//
+//    xResult = pxFunctionList->C_GenerateRandom( xSession, pucRandom, xRandomLength );
+//
+//    if( xResult != 0 )
+//    {
+//        configPRINTF( ( "ERROR: Failed to generate random bytes %d \r\n", xResult ) );
+//    }
+//
+//    return xResult;
+//}
+//
+///*-----------------------------------------------------------*/
+//
+///* @brief Alternate Signing Function to be Passed into PK Context Header
+// * This function was copied from "iot_tls.c"
+// * Recreated to be passed into a PK Context header as our customized signing function.
+// * */
+//static int prvPrivateKeySigningCallback( void * pvContext,
+//                                         mbedtls_md_type_t xMdAlg,
+//                                         const unsigned char * pucHash,
+//                                         size_t xHashLen,
+//                                         unsigned char * pucSig,
+//                                         size_t * pxSigLen,
+//                                         int ( * piRng )( void *,
+//                                                          unsigned char *,
+//                                                          size_t ), /*lint !e955 This parameter is unused. */
+//                                         void * pvRng )
+//{
+//    CK_RV xResult = 0;
+//    int lFinalResult = 0;
+//    CK_MECHANISM xMech = { 0 };
+//    CK_BYTE xToBeSigned[ 256 ];
+//    uint8_t ucTemp[ 64 ] = { 0 }; /* A temporary buffer for the pre-formatted signature. */
+//    CK_ULONG xToBeSignedLen = sizeof( xToBeSigned );
+//
+//    /* Unreferenced parameters. */
+//    ( void ) ( piRng );
+//    ( void ) ( pvRng );
+//    ( void ) ( xMdAlg );
+//
+//    /* Sanity check buffer length. */
+//    if( xHashLen > sizeof( xToBeSigned ) )
+//    {
+//        xResult = CKR_ARGUMENTS_BAD;
+//    }
+//
+//    xMech.mechanism = CKM_ECDSA;
+//    memcpy( xToBeSigned, pucHash, xHashLen );
+//    xToBeSignedLen = xHashLen;
+//
+//    if( 0 == xResult )
+//    {
+//        /* Use the PKCS#11 module to sign. */
+//        xResult = pxFunctionList->C_SignInit( xSession,
+//                                              &xMech,
+//                                              xPrivateKeyHandle );
+//    }
+//
+//    if( 0 == xResult )
+//    {
+//        *pxSigLen = sizeof( xToBeSigned );
+//        xResult = pxFunctionList->C_Sign( xSession,
+//                                          xToBeSigned,
+//                                          xToBeSignedLen,
+//                                          pucSig,
+//                                          ( CK_ULONG_PTR ) pxSigLen );
+//    }
+//
+//    uint8_t * pucSigPtr;
+//
+//    /* PKCS #11 for P256 returns a 64-byte signature with 32 bytes for R and 32 bytes for S.
+//     * This must be converted to an ASN1 encoded array. */
+//    configASSERT( *pxSigLen == 64 );
+//    memcpy( ucTemp, pucSig, *pxSigLen );
+//
+//    pucSig[ 0 ] = 0x30; /* Sequence. */
+//    pucSig[ 1 ] = 0x44; /* The minimum length the signature could be. */
+//    pucSig[ 2 ] = 0x02; /* Integer. */
+//
+//    if( ucTemp[ 0 ] & 0x80 )
+//    {
+//        pucSig[ 1 ]++;
+//        pucSig[ 3 ] = 0x21;
+//        pucSig[ 4 ] = 0x0;
+//        memcpy( &pucSig[ 5 ], ucTemp, 32 );
+//        pucSigPtr = pucSig + 33 + 4;
+//    }
+//    else
+//    {
+//        pucSig[ 3 ] = 0x20;
+//        memcpy( &pucSig[ 4 ], ucTemp, 32 );
+//        pucSigPtr = pucSig + 32 + 4;
+//    }
+//
+//    pucSigPtr[ 0 ] = 0x02; /* Integer. */
+//    pucSigPtr++;
+//
+//    if( ucTemp[ 32 ] & 0x80 )
+//    {
+//        pucSig[ 1 ]++;
+//        pucSigPtr[ 0 ] = 0x21;
+//        pucSigPtr[ 1 ] = 0x00;
+//        pucSigPtr += 2;
+//
+//        memcpy( pucSigPtr, &ucTemp[ 32 ], 32 );
+//    }
+//    else
+//    {
+//        pucSigPtr[ 0 ] = 0x20;
+//        pucSigPtr++;
+//        memcpy( pucSigPtr, &ucTemp[ 32 ], 32 );
+//    }
+//
+//    *pxSigLen = ( CK_ULONG ) pucSig[ 1 ] + 2;
+//
+//    if( xResult != 0 )
+//    {
+//        configPRINTF( ( "ERROR: Failure in signing callback: %d \r\n", xResult ) );
+//    }
+//
+//    return lFinalResult;
+//}
+//
+//
+//
+//
+//
+//  void xGenerateCSR( void )
+////{
+//    /* Generate a PK Context for CSR */
+//    /* Getting header info from ECKEY type */
+//    mbedtls_pk_type_t type_key = MBEDTLS_PK_ECKEY;
+//    const mbedtls_pk_info_t * header = mbedtls_pk_info_from_type( type_key );
+//    int ret = 0;
+//    mbedtls_ecdsa_context xEcdsaContext;
+//
+//    /* Creating copy of header to pass in custom sign function (original header is immutable) */
+//    mbedtls_pk_info_t * header_copy = pvPortMalloc( sizeof( mbedtls_pk_info_t ) );
+//
+//    if( header_copy == NULL )
+//    {
+//        configPRINTF( ( "ERROR: Failed to allocate memory for header_copy variable. CSR cannot be generated\r\n" ) );
+//        return;
+//    }
+//
+//    memcpy( header_copy, header, sizeof( struct mbedtls_pk_info_t ) );
+//
+//    header_copy->sign_func = &prvPrivateKeySigningCallback;
+//
+//    /* Initializing PK Context */
+//    mbedtls_pk_context pk_cont;
+//    mbedtls_pk_init( &pk_cont );
+//    ret = mbedtls_pk_setup( &pk_cont, header_copy );
+//
+//    mbedtls_mpi xR;
+//    mbedtls_mpi xS;
+//
+//    lMbedTLSResult = mbedtls_ecp_group_load( &xEcdsaContext.grp, MBEDTLS_ECP_DP_SECP256R1 );
+//
+//    if ( lMbedTLSResult == 0 )
+//    {
+//        /* The first 2 bytes are for ASN1 type/length encoding. */
+//        lMbedTLSResult = mbedtls_ecp_point_read_binary( &xEcdsaContext.grp, &xEcdsaContext.Q, &xEcPoint[ 2 ], xTemplate.ulValueLen - 2 );
+//    }
+//    else
+//    {
+//        configPRINTF( ("ERROR: %d - mbedTLS failed in setup for signature verification.\r\n", lMbedTLSResult) );
+//    }
+//
+//
+//
+//    pk_cont.pk_ctx = &xEcdsaContext;
+//
+//
+//    /* Generating CSR */
+//    /* Initializing CSR Context */
+//    mbedtls_x509write_csr my_csr;
+//    mbedtls_x509write_csr_init( &my_csr );
+//
+//    if( ret == 0 )
+//    {
+//        ret = mbedtls_x509write_csr_set_subject_name( &my_csr, "CN=ThingName" ); /* This name is configurable to your personal thing name. */
+//    }
+//    else
+//    {
+//        configPRINTF( ( "ERROR: %d - Failed to initialize PK context with given information.\r\n", ret ) );
+//    }
+//
+//    mbedtls_x509write_csr_set_key( &my_csr, &pk_cont );
+//    mbedtls_x509write_csr_set_md_alg( &my_csr, MBEDTLS_MD_SHA256 );
+//
+//    if( ret == 0 )
+//    {
+//        ret = mbedtls_x509write_csr_set_key_usage( &my_csr, MBEDTLS_X509_KU_DIGITAL_SIGNATURE );
+//    }
+//    else
+//    {
+//        configPRINTF( ( "ERROR: %d - Failed to set subject name of CSR context.\r\n", ret ) );
+//    }
+//
+//    if( ret == 0 )
+//    {
+//        ret = mbedtls_x509write_csr_set_ns_cert_type( &my_csr, MBEDTLS_X509_NS_CERT_TYPE_SSL_CLIENT );
+//    }
+//    else
+//    {
+//        configPRINTF( ( "ERROR: %d - Failed to set key usage of CSR context.\r\n", ret ) );
+//    }
+//
+//    /* Output Buffer */
+//    unsigned char * final_csr = pvPortMalloc( 2000 );
+//
+//    if( final_csr == NULL )
+//    {
+//        configPRINTF( ( "ERROR: Failed to allocate memory for final_csr variable. CSR cannot be generated\r\n" ) );
+//        return;
+//    }
+//
+//    size_t len_buf = ( size_t ) 2000;
+//
+//    if( ret == 0 )
+//    {
+//        ret = mbedtls_x509write_csr_pem( &my_csr, final_csr, len_buf, &prvRNG, &xSession );
+//    }
+//    else
+//    {
+//        configPRINTF( ( "ERROR: %d - Failed to set NS Cert Type of CSR context.\r\n", ret ) );
+//    }
+//
+//    if( ret != 0 )
+//    {
+//        configPRINTF( ( "ERROR: %d - Failed to write CSR.\r\n", ret ) );
+//    }
+//
+//    configPRINTF( ("CSR Generated: \r\n %s", final_csr) );
+//
+//    /* Freeing Memory */
+//    mbedtls_ecp_group_free( &xEcdsaContext.grp );
+//    mbedtls_ecdsa_free( &xEcdsaContext );
+//    /*mbedtls_pk_free( &pk_cont ); */
+//    /*header_copy->ctx_free_func( &pk_cont ); */
+//    mbedtls_x509write_csr_free( &my_csr );
+//    vPortFree( final_csr );
+//}
+//

@@ -48,6 +48,7 @@
 #define pkcs11palFILE_NAME_CLIENT_CERTIFICATE    "FreeRTOS_P11_Certificate.dat"
 #define pkcs11palFILE_NAME_KEY                   "FreeRTOS_P11_Key.dat"
 #define pkcs11palFILE_CODE_SIGN_PUBLIC_KEY       "FreeRTOS_P11_CodeSignKey.dat"
+#define pkcs11palFILE_JITP_CERTIFICATE           "FreeRTOS_P11_JITP.dat"
 
 #define PKCS11_PAL_PRINT( X )    vLoggingPrintf X
 
@@ -58,7 +59,8 @@ enum eObjectHandles
     eAwsDevicePrivateKey = 1,
     eAwsDevicePublicKey,
     eAwsDeviceCertificate,
-    eAwsCodeSigningKey
+    eAwsCodeSigningKey,
+    eAwsJITPCertificate
 };
 
 /*-----------------------------------------------------------*/
@@ -115,6 +117,13 @@ void prvLabelToFilenameHandle( uint8_t * pcLabel,
         {
             *pcFileName = pkcs11palFILE_CODE_SIGN_PUBLIC_KEY;
             *pHandle = eAwsCodeSigningKey;
+        }
+        else if ( 0 == memcmp( pcLabel,
+            &pkcs11configLABEL_JITP_CERTIFICATE,
+            sizeof( pkcs11configLABEL_JITP_CERTIFICATE ) ) )
+        {
+            *pcFileName = pkcs11palFILE_JITP_CERTIFICATE;
+            *pHandle = eAwsJITPCertificate;
         }
         else
         {
@@ -288,6 +297,11 @@ CK_RV PKCS11_PAL_GetObjectValue( CK_OBJECT_HANDLE xHandle,
     else if( xHandle == eAwsCodeSigningKey )
     {
         pcFileName = pkcs11palFILE_CODE_SIGN_PUBLIC_KEY;
+        *pIsPrivate = CK_FALSE;
+    }
+    else if ( xHandle == eAwsJITPCertificate )
+    {
+        pcFileName = pkcs11palFILE_JITP_CERTIFICATE;
         *pIsPrivate = CK_FALSE;
     }
     else
